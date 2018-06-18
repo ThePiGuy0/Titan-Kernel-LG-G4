@@ -263,7 +263,6 @@ struct snd_enc_wma {
 	__u32 encodeopt;
 	__u32 encodeopt1;
 	__u32 encodeopt2;
-	__u32 avg_bit_rate;
 };
 
 
@@ -406,7 +405,7 @@ struct snd_codec_desc {
  *		this field and the channelMode field, the channelMode field
  *		overrides.
  * @sample_rate: Audio sample rate of input data in Hz, use values like 48000
- *		for this.
+ *             for this.
  * @bit_rate: Bitrate of encoded data. May be ignored by decoders
  * @rate_control: Encoding rate control. See SND_RATECONTROLMODE defines.
  *               Encoders may rely on profiles for quality levels.

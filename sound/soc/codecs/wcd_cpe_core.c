@@ -36,9 +36,10 @@
 
 #define CMI_CMD_TIMEOUT (10 * HZ)
 #define WCD_CPE_LSM_MAX_SESSIONS 1
-#define WCD_CPE_AFE_MAX_PORTS 1
+#define WCD_CPE_AFE_MAX_PORTS 2
 #define WCD_CPE_DRAM_SIZE 0x30000
 #define WCD_CPE_DRAM_OFFSET 0x50000
+#define AFE_SVC_EXPLICIT_PORT_START 1
 
 #define ELF_FLAG_EXECUTE (1 << 0)
 #define ELF_FLAG_WRITE (1 << 1)
@@ -71,6 +72,10 @@
 	(SVASS_INT_STATUS_RCO_WDOG | \
 	 SVASS_INT_STATUS_WDOG_BITE)
 
+/* AFE out buffer size is always 8 * number of bytes per sample */
+#define AFE_OUT_BUF_SIZE(bit_width) \
+	(8 * (bit_width / BITS_PER_BYTE))
+
 enum afe_port_state {
 	AFE_PORT_STATE_DEINIT = 0,
 	AFE_PORT_STATE_INIT,
@@ -97,6 +102,9 @@ static void wcd_cpe_svc_event_cb(const struct cpe_svc_notification *param);
 static int wcd_cpe_setup_irqs(struct wcd_cpe_core *core);
 static void wcd_cpe_cleanup_irqs(struct wcd_cpe_core *core);
 static u32 ramdump_enable;
+
+static int wcd_cpe_afe_svc_cmd_mode(void *core_handle,
+				    u8 mode);
 
 /* wcd_cpe_lsm_session_active: check if any session is active
  * return true if any session is active.
@@ -1167,9 +1175,9 @@ void wcd_cpe_cmi_afe_cb(const struct cmi_api_notification *param)
 static void wcd_cpe_initialize_afe_port_data(void)
 {
 	struct wcd_cmi_afe_port_data *afe_port_d;
-	int i = 0;
+	int i;
 
-	for (i = 1; i <= WCD_CPE_AFE_MAX_PORTS; i++) {
+	for (i = 0; i <= WCD_CPE_AFE_MAX_PORTS; i++) {
 		afe_port_d = &afe_ports[i];
 		afe_port_d->port_id = i;
 		init_completion(&afe_port_d->afe_cmd_complete);
@@ -1187,9 +1195,9 @@ static void wcd_cpe_initialize_afe_port_data(void)
 static void wcd_cpe_deinitialize_afe_port_data(void)
 {
 	struct wcd_cmi_afe_port_data *afe_port_d;
-	int i = 0;
+	int i;
 
-	for (i = 1; i <= WCD_CPE_AFE_MAX_PORTS; i++) {
+	for (i = 0; i <= WCD_CPE_AFE_MAX_PORTS; i++) {
 		afe_port_d = &afe_ports[i];
 		afe_port_d->port_state = AFE_PORT_STATE_DEINIT;
 		mutex_destroy(&afe_port_d->afe_lock);
@@ -1255,7 +1263,7 @@ static void wcd_cpe_svc_event_cb(const struct cpe_svc_notification *param)
 		 * but we are interested in offline only during
 		 * SSR.
 		 */
-		if (core->ssr_type != WCD_CPE_SSR_EVENT ||
+		if (core->ssr_type != WCD_CPE_SSR_EVENT &&
 		    core->ssr_type != WCD_CPE_BUS_DOWN_EVENT)
 			break;
 
@@ -1774,7 +1782,7 @@ void wcd_cpe_cmi_lsm_callback(const struct cmi_api_notification *param)
 
 		u8 *payload = ((u8 *)param->message) + (sizeof(struct cmi_hdr));
 		u8 result = payload[0];
-		lsm_session->cmd_err_code |= result;
+		lsm_session->cmd_err_code = result;
 		complete(&lsm_session->cmd_comp);
 
 	} else if (hdr->opcode == CPE_LSM_SESSION_CMDRSP_SHARED_MEM_ALLOC) {
@@ -2637,6 +2645,12 @@ static struct cpe_lsm_session *wcd_cpe_alloc_lsm_session(
 				__func__);
 			goto err_afe_svc_reg;
 		}
+
+		/* Once AFE service is registered, send the mode command */
+		ret = wcd_cpe_afe_svc_cmd_mode(core,
+				AFE_SVC_EXPLICIT_PORT_START);
+		if (ret)
+			goto err_afe_mode_cmd;
 	}
 
 	session->lsm_mem_handle = 0;
@@ -2644,6 +2658,9 @@ static struct cpe_lsm_session *wcd_cpe_alloc_lsm_session(
 
 	lsm_sessions[session_id] = session;
 	return session;
+
+err_afe_mode_cmd:
+	cmi_deregister(core->cmi_afe_handle);
 
 err_afe_svc_reg:
 	cmi_deregister(session->cmi_reg_handle);
@@ -2852,6 +2869,22 @@ static int wcd_cpe_buf_dealloc(void *core_handle,
 	return rc;
 }
 
+static int wcd_cpe_buf_control(void *core_handle,
+			       struct cpe_lsm_session *session,
+			       bool alloc,
+			       u32 bufsz, u32 bufcnt)
+{
+	int rc;
+
+	if (alloc)
+		rc = wcd_cpe_buf_alloc(core_handle, session,
+					bufsz, bufcnt);
+	else
+		rc = wcd_cpe_buf_dealloc(core_handle, session,
+					 bufsz, bufcnt);
+
+	return rc;
+}
 /*
  * wcd_cpe_lsm_lab_enable_disable: enable/disable lab
  * @core: handle to wcd_cpe_core
@@ -2910,12 +2943,6 @@ static int wcd_cpe_lsm_control_lab(void *core_handle,
 	struct wcd_cpe_core *core = (struct wcd_cpe_core *)core_handle;
 
 	if (enable) {
-		rc = wcd_cpe_buf_alloc(core_handle, session, bufsz, bufcnt);
-		if (rc) {
-			pr_err("%s: DMA buffer allocation failed rc %d\n",
-			       __func__, rc);
-			return rc;
-		}
 		rc = wcd_cpe_lsm_lab_enable_disable(core, session, enable);
 		if (rc) {
 			pr_err("%s: LAB disable/ Enable failed rc %d\n",
@@ -2924,15 +2951,9 @@ static int wcd_cpe_lsm_control_lab(void *core_handle,
 		}
 		session->lab.core_handle = core_handle;
 		session->lab.lsm_s = session;
+		session->lab.is_lab_enabled = true;
 	} else {
-		rc = wcd_cpe_buf_dealloc(core_handle, session, bufsz, bufcnt);
-		/* do not return error for DMA dealloc put
-		 * session in detection mode
-		 */
-		if (rc) {
-			pr_err("%s: DMA buffer De-allocation failed, rc %d\n",
-			       __func__, rc);
-		}
+		session->lab.is_lab_enabled = false;
 
 		rc = wcd_cpe_lsm_lab_enable_disable(core, session, enable);
 		if (rc) {
@@ -2940,7 +2961,6 @@ static int wcd_cpe_lsm_control_lab(void *core_handle,
 			       __func__, rc);
 			return rc;
 		}
-		session->lab.lab_enable = false;
 	}
 	return rc;
 }
@@ -3016,6 +3036,19 @@ static int wcd_cpe_dealloc_lsm_session(void *core_handle,
 	return ret;
 }
 
+static int wcd_cpe_cdc_lab_enable(void *core_handle)
+{
+	struct wcd_cpe_core *core = (struct wcd_cpe_core *)core_handle;
+	int rc;
+
+	rc = cpe_svc_toggle_lab(core->cpe_handle, true);
+	if (rc)
+		dev_err(core->dev,
+			"%s: lab enable failed, err = %d\n",
+			__func__, rc);
+	return rc;
+}
+
 static int slim_master_read_enable(void *core_handle,
 				   struct cpe_lsm_session *session)
 {
@@ -3067,12 +3100,7 @@ static int slim_master_read_enable(void *core_handle,
 		rc = -EINVAL;
 		goto fail_slim_open;
 	}
-	rc = cpe_svc_toggle_lab(core->cpe_handle, true);
-	if (rc) {
-		pr_err("%s: SVC toggle codec LAB Enable error\n", __func__);
-		rc = -EINVAL;
-		goto fail_slim_open;
-	}
+
 	init_waitqueue_head(&lab_s->period_wait);
 	WCD_CPE_REL_LOCK(&session->lsm_lock, "lsm");
 	return 0;
@@ -3120,7 +3148,8 @@ int slim_master_read(void *core_handle,
 	return rc;
 }
 static int wcd_cpe_lsm_stop_lab(void *core_handle,
-				struct cpe_lsm_session *session)
+				struct cpe_lsm_session *session,
+				bool post_stop)
 {
 	struct wcd_cpe_lsm_lab *lab_s = NULL;
 	struct wcd_cpe_core *core = (struct wcd_cpe_core *)core_handle;
@@ -3132,41 +3161,86 @@ static int wcd_cpe_lsm_stop_lab(void *core_handle,
 	wcd9xxx = codec->control_data;
 	lab_s = &session->lab;
 	WCD_CPE_GRAB_LOCK(&session->lsm_lock, "lsm");
-	/* This seqeunce should be followed strictly for closing sequence */
-	if (core->cpe_cdc_cb->lab_cdc_ch_ctl)
-		core->cpe_cdc_cb->lab_cdc_ch_ctl(codec, 0);
-	else
-		pr_err("%s: Failed to disable codec slave port\n",
-			__func__);
 
-	rc = wcd9xxx_slim_ch_master_close(wcd9xxx, &lab_s->slim_handle);
-	if (rc != 0)
-		pr_err("%s: wcd9xxx_slim_pcm_close rc %d\n",
-			__func__, rc);
+	if (!post_stop) {
+		/*
+		 * This seqeunce should be followed
+		 * strictly for closing sequence
+		 */
+		if (core->cpe_cdc_cb->lab_cdc_ch_ctl)
+			core->cpe_cdc_cb->lab_cdc_ch_ctl(codec, 0);
+		else
+			pr_err("%s: Failed to disable codec slave port\n",
+				__func__);
 
-	rc = wcd_cpe_lsm_eob(core, session);
-	if (rc != 0)
-		dev_err(core->dev,
-			"%s: wcd_cpe_lsm_eob failed, rc %d\n",
-		       __func__, rc);
+		rc = wcd9xxx_slim_ch_master_close(wcd9xxx, &lab_s->slim_handle);
+		if (rc != 0)
+			pr_err("%s: wcd9xxx_slim_pcm_close rc %d\n",
+				__func__, rc);
+	} else {
 
-	rc = cpe_svc_toggle_lab(core->cpe_handle, false);
-	if (rc)
-		dev_err(core->dev,
-			"%s: LAB Voice Tx codec error, rc %d\n",
-			__func__, rc);
+		rc = wcd_cpe_lsm_eob(core, session);
+		if (rc != 0)
+			dev_err(core->dev,
+				"%s: wcd_cpe_lsm_eob failed, rc %d\n",
+				__func__, rc);
 
-	lab_s->buf_idx = 0;
-	lab_s->thread_status = MSM_LSM_LAB_THREAD_STOP;
-	atomic_set(&lab_s->in_count, 0);
-	lab_s->dma_write = 0;
-	if (core->cpe_cdc_cb->cdc_ext_clk)
-		core->cpe_cdc_cb->cdc_ext_clk(codec, false, false);
-	else
-		pr_err("%s: Failed to disable cdc ext clk\n",
-			__func__);
+		rc = cpe_svc_toggle_lab(core->cpe_handle, false);
+		if (rc)
+			dev_err(core->dev,
+				"%s: LAB Voice Tx codec error, rc %d\n",
+				__func__, rc);
+
+		lab_s->buf_idx = 0;
+		lab_s->thread_status = MSM_LSM_LAB_THREAD_STOP;
+		atomic_set(&lab_s->in_count, 0);
+		lab_s->dma_write = 0;
+		if (core->cpe_cdc_cb->cdc_ext_clk)
+			core->cpe_cdc_cb->cdc_ext_clk(codec, false, false);
+		else
+			pr_err("%s: Failed to disable cdc ext clk\n",
+				__func__);
+	}
+
 	WCD_CPE_REL_LOCK(&session->lsm_lock, "lsm");
 	return rc;
+}
+
+static int wcd_cpe_lsm_set_fmt_cfg(void *core_handle,
+			struct cpe_lsm_session *session)
+{
+	int ret;
+	struct cpe_lsm_output_format_cfg out_fmt_cfg;
+	struct wcd_cpe_core *core = core_handle;
+
+	ret = wcd_cpe_is_valid_lsm_session(core, session, __func__);
+	if (ret)
+		goto done;
+
+	WCD_CPE_GRAB_LOCK(&session->lsm_lock, "lsm");
+
+	memset(&out_fmt_cfg, 0, sizeof(out_fmt_cfg));
+	if (fill_lsm_cmd_header_v0_inband(&out_fmt_cfg.hdr,
+			session->id, OUT_FMT_CFG_CMD_PAYLOAD_SIZE,
+			CPE_LSM_SESSION_CMD_TX_BUFF_OUTPUT_CONFIG)) {
+		ret = -EINVAL;
+		goto err_ret;
+	}
+
+	out_fmt_cfg.format = session->out_fmt_cfg.format;
+	out_fmt_cfg.packing = session->out_fmt_cfg.pack_mode;
+	out_fmt_cfg.data_path_events = session->out_fmt_cfg.data_path_events;
+
+	ret = wcd_cpe_cmi_send_lsm_msg(core, session, &out_fmt_cfg);
+	if (ret)
+		dev_err(core->dev,
+			"%s: lsm_set_output_format_cfg failed, err = %d\n",
+			__func__, ret);
+
+err_ret:
+	WCD_CPE_REL_LOCK(&session->lsm_lock, "lsm");
+done:
+	return ret;
 }
 
 /*
@@ -3192,10 +3266,12 @@ int wcd_cpe_get_lsm_ops(struct wcd_cpe_lsm_ops *lsm_ops)
 	lsm_ops->lsm_lab_data_channel_read_status = slim_master_read_status;
 	lsm_ops->lsm_lab_data_channel_open = slim_master_read_enable;
 	lsm_ops->lsm_set_data = wcd_cpe_lsm_set_data;
+	lsm_ops->lsm_set_fmt_cfg = wcd_cpe_lsm_set_fmt_cfg;
+	lsm_ops->lsm_cdc_start_lab = wcd_cpe_cdc_lab_enable;
+	lsm_ops->lsm_lab_buf_cntl =  wcd_cpe_buf_control;
 	return 0;
 }
 EXPORT_SYMBOL(wcd_cpe_get_lsm_ops);
-
 
 static int fill_afe_cmd_header(struct cmi_hdr *hdr, u8 port_id,
 				u16 opcode, u8 pld_size,
@@ -3519,6 +3595,88 @@ static int wcd_cpe_is_valid_port(struct wcd_cpe_core *core,
 	return 0;
 }
 
+static int wcd_cpe_afe_svc_cmd_mode(void *core_handle,
+				    u8 mode)
+{
+	struct cpe_afe_svc_cmd_mode afe_mode;
+	struct wcd_cpe_core *core = core_handle;
+	struct wcd_cmi_afe_port_data *afe_port_d;
+	int ret;
+
+	afe_port_d = &afe_ports[0];
+	/*
+	 * AFE SVC mode command is for the service and not port
+	 * specific, hence use AFE port as 0 so the command will
+	 * be applied to all AFE ports on CPE.
+	 */
+	afe_port_d->port_id = 0;
+
+	WCD_CPE_GRAB_LOCK(&afe_port_d->afe_lock, "afe");
+	memset(&afe_mode, 0, sizeof(afe_mode));
+	if (fill_afe_cmd_header(&afe_mode.hdr, afe_port_d->port_id,
+				CPE_AFE_SVC_CMD_LAB_MODE,
+				CPE_AFE_CMD_MODE_PAYLOAD_SIZE,
+				false)) {
+		ret = -EINVAL;
+		goto err_ret;
+	}
+
+	afe_mode.mode = mode;
+
+	ret = wcd_cpe_cmi_send_afe_msg(core, afe_port_d, &afe_mode);
+	if (ret)
+		dev_err(core->dev,
+			"%s: afe_svc_mode cmd failed, err = %d\n",
+			__func__, ret);
+
+err_ret:
+	WCD_CPE_REL_LOCK(&afe_port_d->afe_lock, "afe");
+	return ret;
+}
+
+static int wcd_cpe_afe_cmd_port_cfg(void *core_handle,
+		struct wcd_cpe_afe_port_cfg *afe_cfg)
+{
+	struct cpe_afe_cmd_port_cfg port_cfg_cmd;
+	struct wcd_cpe_core *core = core_handle;
+	struct wcd_cmi_afe_port_data *afe_port_d;
+	int ret;
+
+	ret = wcd_cpe_is_valid_port(core, afe_cfg, __func__);
+	if (ret)
+		goto done;
+
+	afe_port_d = &afe_ports[afe_cfg->port_id];
+	afe_port_d->port_id = afe_cfg->port_id;
+
+	WCD_CPE_GRAB_LOCK(&afe_port_d->afe_lock, "afe");
+	memset(&port_cfg_cmd, 0, sizeof(port_cfg_cmd));
+	if (fill_afe_cmd_header(&port_cfg_cmd.hdr,
+			afe_cfg->port_id,
+			CPE_AFE_PORT_CMD_GENERIC_CONFIG,
+			CPE_AFE_CMD_PORT_CFG_PAYLOAD_SIZE,
+			false)) {
+		ret = -EINVAL;
+		goto err_ret;
+	}
+
+	port_cfg_cmd.bit_width = afe_cfg->bit_width;
+	port_cfg_cmd.num_channels = afe_cfg->num_channels;
+	port_cfg_cmd.sample_rate = afe_cfg->sample_rate;
+	port_cfg_cmd.buffer_size = AFE_OUT_BUF_SIZE(afe_cfg->bit_width);
+
+	ret = wcd_cpe_cmi_send_afe_msg(core, afe_port_d, &port_cfg_cmd);
+	if (ret)
+		dev_err(core->dev,
+			"%s: afe_port_config failed, err = %d\n",
+			__func__, ret);
+
+err_ret:
+	WCD_CPE_REL_LOCK(&afe_port_d->afe_lock, "afe");
+done:
+	return ret;
+}
+
 /*
  * wcd_cpe_afe_set_params: set the parameters for afe port
  * @afe_cfg: configuration data for the port for which the
@@ -3748,6 +3906,7 @@ int wcd_cpe_get_afe_ops(struct wcd_cpe_afe_ops *afe_ops)
 	afe_ops->afe_port_stop = wcd_cpe_afe_port_stop;
 	afe_ops->afe_port_suspend = wcd_cpe_afe_port_suspend;
 	afe_ops->afe_port_resume = wcd_cpe_afe_port_resume;
+	afe_ops->afe_port_cmd_cfg = wcd_cpe_afe_cmd_port_cfg;
 
 	return 0;
 }

@@ -2198,6 +2198,22 @@ struct afe_param_id_device_hw_delay_cfg {
 	uint32_t    delay_in_us;
 } __packed;
 
+#define AFE_PARAM_ID_SET_TOPOLOGY    0x0001025A
+#define AFE_API_VERSION_TOPOLOGY_V1 0x1
+
+struct afe_param_id_set_topology_cfg {
+	/*
+	 * Minor version used for tracking afe topology id configuration.
+	 * @values #AFE_API_VERSION_TOPOLOGY_V1
+	 */
+	u32		minor_version;
+	/*
+	 * Id of the topology for the afe session.
+	 * @values Any valid AFE topology ID
+	 */
+	u32		topology_id;
+} __packed;
+
 union afe_port_config {
 	struct afe_param_id_pcm_cfg               pcm;
 	struct afe_param_id_i2s_cfg               i2s;
@@ -2208,6 +2224,7 @@ union afe_port_config {
 	struct afe_param_id_pseudo_port_cfg       pseudo_port;
 	struct afe_param_id_device_hw_delay_cfg   hw_delay;
 	struct afe_param_id_spdif_cfg             spdif;
+	struct afe_param_id_set_topology_cfg      topology;
 } __packed;
 
 struct afe_audioif_config_command_no_payload {
@@ -2752,12 +2769,6 @@ struct asm_softvolume_params {
 
 #define ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2 0x00010DA5
 
-#if defined(CONFIG_SND_LGE_EFFECT) || defined(CONFIG_SND_LGE_NORMALIZER) || defined(CONFIG_SND_LGE_MABL)
-#define ASM_STREAM_POSTPROC_TOPO_ID_DEFAULT_LGE 0x10009009
-#define ASM_STREAM_POSTPROC_TOPO_ID_OFFLOAD_LGE 0x10009010
-#endif
-#define ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V3 0x00010DDC
-
 #define ASM_MEDIA_FMT_EVRCB_FS 0x00010BEF
 
 #define ASM_MEDIA_FMT_EVRCWB_FS 0x00010BF0
@@ -2825,51 +2836,6 @@ struct asm_multi_channel_pcm_fmt_blk_v2 {
  */
 } __packed;
 
-struct asm_multi_channel_pcm_fmt_blk_v3 {
-	uint16_t                num_channels;
-/*
- * Number of channels
- * Supported values: 1 to 8
- */
-
-	uint16_t                bits_per_sample;
-/*
- * Number of bits per sample per channel
- * Supported values: 16, 24
- */
-
-	uint32_t                sample_rate;
-/*
- * Number of samples per second
- * Supported values: 2000 to 48000, 96000,192000 Hz
- */
-
-	uint16_t                is_signed;
-/* Flag that indicates that PCM samples are signed (1) */
-
-	uint16_t                sample_word_size;
-/*
- * Size in bits of the word that holds a sample of a channel.
- * Supported values: 12,24,32
- */
-
-	uint8_t                 channel_mapping[8];
-/*
- * Each element, i, in the array describes channel i inside the buffer where
- * 0 <= i < num_channels. Unused channels are set to 0.
- */
-} __packed;
-
-/*
- * Payload of the multichannel PCM configuration parameters in
- * the ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V3 media format.
- */
-struct asm_multi_channel_pcm_fmt_blk_param_v3 {
-	struct apr_hdr hdr;
-	struct asm_data_cmd_media_fmt_update_v2 fmt_blk;
-	struct asm_multi_channel_pcm_fmt_blk_v3 param;
-} __packed;
-
 struct asm_stream_cmd_set_encdec_param {
 	u32                  param_id;
 	/* ID of the parameter. */
@@ -2904,66 +2870,6 @@ struct asm_dec_ddp_endp_param_v2 {
 	struct asm_stream_cmd_set_encdec_param  encdec;
 	int endp_param_value;
 } __packed;
-
-
-/*
- * Payload of the multichannel PCM encoder configuration parameters in
- * the ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V3 media format.
- */
-
-struct asm_multi_channel_pcm_enc_cfg_v3 {
-	struct apr_hdr hdr;
-	struct asm_stream_cmd_set_encdec_param encdec;
-	struct asm_enc_cfg_blk_param_v2 encblk;
-	uint16_t num_channels;
-	/*
-	 * Number of PCM channels.
-	 * @values
-	 * - 0 -- Native mode
-	 * - 1 -- 8 channels
-	 * Native mode indicates that encoding must be performed with the number
-	 * of channels at the input.
-	 */
-	uint16_t  bits_per_sample;
-	/*
-	 * Number of bits per sample per channel.
-	 * @values 16, 24
-	 */
-	uint32_t  sample_rate;
-	/*
-	 * Number of samples per second.
-	 * @values 0, 8000 to 48000 Hz
-	 * A value of 0 indicates the native sampling rate. Encoding is
-	 * performed at the input sampling rate.
-	 */
-	uint16_t  is_signed;
-	/*
-	 * Flag that indicates the PCM samples are signed (1). Currently, only
-	 * signed PCM samples are supported.
-	 */
-	uint16_t    sample_word_size;
-	/*
-	 * The size in bits of the word that holds a sample of a channel.
-	 * @values 16, 24, 32
-	 * 16-bit samples are always placed in 16-bit words:
-	 * sample_word_size = 1.
-	 * 24-bit samples can be placed in 32-bit words or in consecutive
-	 * 24-bit words.
-	 * - If sample_word_size = 32, 24-bit samples are placed in the
-	 * most significant 24 bits of a 32-bit word.
-	 * - If sample_word_size = 24, 24-bit samples are placed in
-	 * 24-bit words. @tablebulletend
-	 */
-	uint8_t   channel_mapping[8];
-	/*
-	 * Channel mapping array expected at the encoder output.
-	 *  Channel[i] mapping describes channel i inside the buffer, where
-	 *  0 @le i < num_channels. All valid used channels must be present at
-	 *  the beginning of the array.
-	 * If Native mode is set for the channels, this field is ignored.
-	 * @values See Section @xref{dox:PcmChannelDefs}
-	 */
-};
 
 /* @brief Multichannel PCM encoder configuration structure used
  * in the #ASM_STREAM_CMD_OPEN_READ_V2 command.
@@ -4359,76 +4265,7 @@ struct asm_stream_cmd_open_write_v3 {
  */
 } __packed;
 
-#define ASM_STREAM_CMD_OPEN_PULL_MODE_WRITE    0x00010DD9
-
-/* Bitmask for the stream_perf_mode subfield. */
-#define ASM_BIT_MASK_STREAM_PERF_FLAG_PULL_MODE_WRITE 0xE0000000UL
-
-/* Bitmask for the stream_perf_mode subfield. */
-#define ASM_SHIFT_STREAM_PERF_FLAG_PULL_MODE_WRITE 29
-
-#define ASM_STREAM_CMD_OPEN_PUSH_MODE_READ  0x00010DDA
-
-#define ASM_BIT_MASK_STREAM_PERF_FLAG_PUSH_MODE_READ 0xE0000000UL
-
-#define ASM_SHIFT_STREAM_PERF_FLAG_PUSH_MODE_READ 29
-
-#define ASM_DATA_EVENT_WATERMARK 0x00010DDB
-
-struct asm_shared_position_buffer {
-	volatile uint32_t               frame_counter;
-/* Counter used to handle interprocessor synchronization issues.
- * When frame_counter is 0: read_index, wall_clock_us_lsw, and
- * wall_clock_us_msw are invalid.
- * Supported values: >= 0.
- */
-
-	volatile uint32_t               index;
-/* Index in bytes from where the aDSP is reading/writing.
- * Supported values: 0 to circular buffer size - 1
- */
-
-	volatile uint32_t               wall_clock_us_lsw;
-/* Lower 32 bits of the 64-bit wall clock time in microseconds when the
- * read index was updated.
- * Supported values: >= 0
- */
-
-	volatile uint32_t               wall_clock_us_msw;
-/* Upper 32 bits of the 64 bit wall clock time in microseconds when the
- * read index was updated
- * Supported values: >= 0
- */
-} __packed;
-
-struct asm_shared_watermark_level {
-	uint32_t                watermark_level_bytes;
-} __packed;
-
-struct asm_stream_cmd_open_shared_io {
-	struct apr_hdr          hdr;
-	uint32_t                mode_flags;
-	uint16_t                endpoint_type;
-	uint16_t                topo_bits_per_sample;
-	uint32_t                topo_id;
-	uint32_t                fmt_id;
-	uint32_t                shared_pos_buf_phy_addr_lsw;
-	uint32_t                shared_pos_buf_phy_addr_msw;
-	uint16_t                shared_pos_buf_mem_pool_id;
-	uint16_t                shared_pos_buf_num_regions;
-	uint32_t                shared_pos_buf_property_flag;
-	uint32_t                shared_circ_buf_start_phy_addr_lsw;
-	uint32_t                shared_circ_buf_start_phy_addr_msw;
-	uint32_t                shared_circ_buf_size;
-	uint16_t                shared_circ_buf_mem_pool_id;
-	uint16_t                shared_circ_buf_num_regions;
-	uint32_t                shared_circ_buf_property_flag;
-	uint32_t                num_watermark_levels;
-	struct asm_multi_channel_pcm_fmt_blk_v3         fmt;
-	struct avs_shared_map_region_payload            map_region_pos_buf;
-	struct avs_shared_map_region_payload            map_region_circ_buf;
-	struct asm_shared_watermark_level watermark[0];
-} __packed;
+#define ASM_STREAM_CMD_OPEN_READ_V2                 0x00010D8C
 
 #define ASM_STREAM_CMD_OPEN_READ_V3                 0x00010DB4
 
@@ -7059,7 +6896,7 @@ struct asm_eq_params {
 /* Set Q6 topologies */
 #define ASM_CMD_ADD_TOPOLOGIES				0x00010DBE
 #define ADM_CMD_ADD_TOPOLOGIES				0x00010335
-
+#define AFE_CMD_ADD_TOPOLOGIES				0x000100f8
 /* structure used for both ioctls */
 struct cmd_set_topologies {
 	struct apr_hdr hdr;
@@ -7317,12 +7154,15 @@ struct asm_dts_eagle_param_get {
 #define LSM_SESSION_CMD_OPEN_TX				(0x00012A82)
 #define LSM_SESSION_CMD_CLOSE_TX			(0x00012A88)
 #define LSM_SESSION_CMD_SET_PARAMS			(0x00012A83)
+#define LSM_SESSION_CMD_SET_PARAMS_V2			(0x00012A8F)
 #define LSM_SESSION_CMD_REGISTER_SOUND_MODEL		(0x00012A84)
 #define LSM_SESSION_CMD_DEREGISTER_SOUND_MODEL		(0x00012A85)
 #define LSM_SESSION_CMD_START				(0x00012A86)
 #define LSM_SESSION_CMD_STOP				(0x00012A87)
 #define LSM_SESSION_CMD_EOB				(0x00012A89)
 #define LSM_SESSION_CMD_READ				(0x00012A8A)
+#define LSM_SESSION_CMD_OPEN_TX_V2			(0x00012A8B)
+#define LSM_CMD_ADD_TOPOLOGIES				(0x00012A8C)
 
 #define LSM_SESSION_EVENT_DETECTION_STATUS		(0x00012B00)
 #define LSM_SESSION_EVENT_DETECTION_STATUS_V2		(0x00012B01)
@@ -7334,13 +7174,12 @@ struct asm_dts_eagle_param_get {
 #define LSM_PARAM_ID_OPERATION_MODE			(0x00012C02)
 #define LSM_PARAM_ID_GAIN				(0x00012C03)
 #define LSM_PARAM_ID_CONNECT_TO_PORT			(0x00012C04)
-#define LSM_PARAM_ID_KEYWORD_DETECT_SENSITIVITY		(0x00012C05)
-#define LSM_PARAM_ID_USER_DETECT_SENSITIVITY		(0x00012C06)
 #define LSM_PARAM_ID_FEATURE_COMPENSATION_DATA		(0x00012C07)
 #define LSM_PARAM_ID_MIN_CONFIDENCE_LEVELS		(0x00012C07)
 #define LSM_MODULE_ID_LAB				(0x00012C08)
 #define LSM_PARAM_ID_LAB_ENABLE				(0x00012C09)
 #define LSM_PARAM_ID_LAB_CONFIG				(0x00012C0A)
+#define LSM_MODULE_ID_FRAMEWORK				(0x00012C0E)
 
 /* HW MAD specific */
 #define AFE_MODULE_HW_MAD				(0x00010230)
@@ -7467,11 +7306,9 @@ struct afe_param_id_clip_bank_sel {
 /* Operation needs more data or resources. */
 #define ADSP_ENEEDMORE    0x00000012
 /* Operation does not have memory. */
-#define ADSP_ENOMEMORY    0x00000014
+#define ADSP_ENOMEMORY     0x00000014
 /* Item does not exist. */
-#define ADSP_ENOTEXIST    0x00000015
-/* Max count for adsp error code sent to HLOS*/
-#define ADSP_ERR_MAX      (ADSP_ENOTEXIST + 1)
+#define ADSP_ENOTEXIST      0x00000015
 /* Operation is finished. */
 #define ADSP_ETERMINATED    0x00011174
 
@@ -7493,7 +7330,6 @@ struct afe_param_id_clip_bank_sel {
 #define Q6AFE_LPASS_OSR_CLK_DISABLE		     0x0
 
 /* Supported Bit clock values */
-#define Q6AFE_LPASS_IBIT_CLK_12_P288_MHZ	0xBB8000
 #define Q6AFE_LPASS_IBIT_CLK_8_P192_MHZ		0x7D0000
 #define Q6AFE_LPASS_IBIT_CLK_6_P144_MHZ		0x5DC000
 #define Q6AFE_LPASS_IBIT_CLK_4_P096_MHZ		0x3E8000
@@ -7802,12 +7638,6 @@ struct afe_port_cmd_set_aanc_acdb_table {
 #define CUSTOM_STEREO_INDEX_PARAM	0x0002
 #define Q14_GAIN_ZERO_POINT_FIVE	0x2000
 #define Q14_GAIN_UNITY			0x4000
-
-struct default_chmixer_param_id_coeff {
-	uint32_t	index;
-	uint16_t	num_output_channels;
-	uint16_t	num_input_channels;
-};
 
 struct afe_svc_cmd_set_clip_bank_selection {
 	struct apr_hdr hdr;

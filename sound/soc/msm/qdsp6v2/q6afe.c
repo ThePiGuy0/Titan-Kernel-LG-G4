@@ -26,10 +26,6 @@
 #include "msm-pcm-routing-v2.h"
 #include <sound/audio_cal_utils.h>
 
-#ifdef CONFIG_SND_SOC_DYBOOST
-#include <../../codecs/tas2552.h>
-#endif
-
 #define WAKELOCK_TIMEOUT	5000
 enum {
 	AFE_COMMON_RX_CAL = 0,
@@ -38,6 +34,8 @@ enum {
 	AFE_FB_SPKR_PROT_CAL,
 	AFE_HW_DELAY_CAL,
 	AFE_SIDETONE_CAL,
+	AFE_TOPOLOGY_CAL,
+	AFE_CUST_TOPOLOGY_CAL,
 	MAX_AFE_CAL_TYPES
 };
 
@@ -69,16 +67,6 @@ enum {
 	QUICK_CALIB_DISABLE,
 	QUICK_CALIB_ENABLE
 };
-
-
-#ifdef CONFIG_SND_TI_SPK_PROT_OPALUM
-#ifdef CONFIG_SND_SOC_SPKINFO
-int32_t opalum_excursion_model[3] = {0, };
-#else
-int32_t opalum_excursion_model[2] = {0, };
-#endif
-int32_t opalum_current_temperature[2] = {0, };
-#endif
 
 struct wlock {
 	struct wakeup_source ws;
@@ -113,6 +101,7 @@ struct afe_ctl {
 	uint32_t afe_sample_rates[AFE_MAX_PORTS];
 	struct aanc_data aanc_info;
 	struct mutex afe_cmd_lock;
+	int set_custom_topology;
 };
 
 static atomic_t afe_ports_mad_type[SLIMBUS_PORT_LAST - SLIMBUS_0_RX];
@@ -135,6 +124,7 @@ bool afe_close_done[2] = {true, true};
 
 static int afe_get_cal_hw_delay(int32_t path,
 				struct audio_cal_hw_delay_entry *entry);
+static void remap_cal_data(struct cal_block_data *cal_block, int cal_index);
 
 void afe_set_aanc_info(struct aanc_data *q6_aanc_info)
 {
@@ -167,26 +157,6 @@ static void afe_callback_debug_print(struct apr_client_data *data)
 			__func__, data->opcode, data->payload_size);
 }
 
-#ifdef CONFIG_SND_TI_SPK_PROT_OPALUM
-extern int check_reg_cmd;
-unsigned int *payload_check_reg_cmd = NULL;
-extern struct work_struct work_queue_boost;
-#endif
-
-#ifdef CONFIG_SND_SOC_DYBOOST
-unsigned int *payload_protection_boost = NULL;
-extern int boost_command;
-extern struct work_struct work_queue_boost;
-#endif
-
-#ifdef CONFIG_SND_SOC_SPKINFO
-unsigned int over_temp_data[2] = {0, };
-unsigned int *payload_protection = NULL;
-extern struct work_struct work_queue;
-extern wait_queue_head_t myevent_wq;
-extern rwlock_t myevent_lock;
-#endif
-
 static int32_t afe_callback(struct apr_client_data *data, void *priv)
 {
 	if (!data) {
@@ -194,12 +164,17 @@ static int32_t afe_callback(struct apr_client_data *data, void *priv)
 		return -EINVAL;
 	}
 	if (data->opcode == RESET_EVENTS) {
-		pr_debug("%s: reset event = %d %d apr[%p]\n",
+		pr_debug("%s: reset event = %d %d apr[%pK]\n",
 			__func__,
 			data->reset_event, data->reset_proc, this_afe.apr);
 
 		cal_utils_clear_cal_block_q6maps(MAX_AFE_CAL_TYPES,
 			this_afe.cal_data);
+
+		/* Reset the custom topology mode: to resend again to AFE. */
+		mutex_lock(&this_afe.cal_data[AFE_CUST_TOPOLOGY_CAL]->lock);
+		this_afe.set_custom_topology = 1;
+		mutex_unlock(&this_afe.cal_data[AFE_CUST_TOPOLOGY_CAL]->lock);
 
 		if (this_afe.apr) {
 			apr_reset(this_afe.apr);
@@ -216,75 +191,15 @@ static int32_t afe_callback(struct apr_client_data *data, void *priv)
 		return 0;
 	}
 	afe_callback_debug_print(data);
-#ifdef CONFIG_SND_TI_SPK_PROT_OPALUM
-        /* be got spk temp data from OSPL(ADSP) when is playing music */
-	if (data->opcode == AFE_DATA_EVENT_STATUS)
-	{
-	    //send cmd to tas driver for reg check
-		payload_check_reg_cmd = (unsigned int *)data->payload;
-		check_reg_cmd = payload_check_reg_cmd[0];
-		schedule_work(&work_queue_boost);
-
-		#ifdef CONFIG_SND_SOC_SPKINFO
-	      	write_lock(&myevent_lock);
-	      	payload_protection = (unsigned int *)data->payload;
-	      	over_temp_data[0] = payload_protection[0];
-		over_temp_data[1] = payload_protection[1];
-	      	pr_debug("spk temp: data1 = 0x%x data2:0x%x \n",
-		      payload_protection[0], payload_protection[1]);
-	      	write_unlock(&myevent_lock);
-	      	wake_up_interruptible(&myevent_wq);
-		#else
-		pr_debug("get AFE_DATA_EVENT_STATUS:0x%x \n",AFE_DATA_EVENT_STATUS);
-		#endif
-	}
-#ifdef CONFIG_SND_SOC_DYBOOST
-	if (data->opcode == 0xF0012B04)
-	{
-	      payload_protection_boost = (unsigned int *)data->payload;
-	      /*pr_err("op_code = 0x%x boost_cmd: 0x%x data2:0x%x \n",
-		      data->opcode, payload_protection_boost[0], payload_protection_boost[1]);
-		*/
-	      boost_command = payload_protection_boost[0];
-	      schedule_work(&work_queue_boost);
-	}
-#endif
-#endif
 	if (data->opcode == AFE_PORT_CMDRSP_GET_PARAM_V2) {
 		u8 *payload = data->payload;
-#ifdef CONFIG_SND_TI_SPK_PROT_OPALUM
-        uint32_t* payload32 = data->payload;
-        pr_debug("opalum get param opcode = 0x%x, payload32[1]:0x%x \n", data->opcode,payload32[1]);
-	/* Callback for Opalum communication */
-	if(payload32[1] == RX_MODULE)
-	{
-		switch(payload32[2]) // payload32[2] contains the parameter ID
-		{
-			case EXCURSION_DATA:
-				opalum_excursion_model[0] = (int32_t)payload32[4]; // This is the left channel excursion model
-				opalum_excursion_model[1] = (int32_t)payload32[5]; // This is the right channel excursion model
-				#ifdef CONFIG_SND_SOC_SPKINFO
-				opalum_excursion_model[2] = (int32_t)payload32[6]; // it means rx porcess end
-				#endif
-				break;
-			case TEMPERATURE_DATA:
-				opalum_current_temperature[0] = (int32_t)payload32[4]; // This is the left channel temperature
-				opalum_current_temperature[1] = (int32_t)payload32[5]; // This is the right channel temperature
-				break;
-			default:
-				break;
-		}
-		 pr_debug("@@@payload32[4]:0x%x, palyoad32[5]:0x%x", payload32[4], payload32[5]);
-		 atomic_set(&this_afe.state, 0);
-	} else
-	{
-#endif
+
 		if (rtac_make_afe_callback(data->payload, data->payload_size))
 			return 0;
 
 		if ((data->payload_size < sizeof(this_afe.calib_data))
 			|| !payload || (data->token >= AFE_MAX_PORTS)) {
-			pr_err("%s: Error: size %d payload %p token %d\n",
+			pr_err("%s: Error: size %d payload %pK token %d\n",
 				__func__, data->payload_size,
 				payload, data->token);
 			return -EINVAL;
@@ -300,9 +215,6 @@ static int32_t afe_callback(struct apr_client_data *data, void *priv)
 		} else
 			atomic_set(&this_afe.state, -1);
 		wake_up(&this_afe.wait[data->token]);
-#ifdef CONFIG_SND_TI_SPK_PROT_OPALUM
-}
-#endif
 	} else if (data->payload_size) {
 		uint32_t *payload;
 		uint16_t port_id = 0;
@@ -341,6 +253,12 @@ static int32_t afe_callback(struct apr_client_data *data, void *priv)
 				break;
 			case AFE_PORT_DATA_CMD_RT_PROXY_PORT_READ_V2:
 				port_id = RT_PROXY_PORT_001_RX;
+				break;
+			case AFE_CMD_ADD_TOPOLOGIES:
+				atomic_set(&this_afe.state, 0);
+				wake_up(&this_afe.wait[data->token]);
+				pr_debug("%s: AFE_CMD_ADD_TOPOLOGIES cmd 0x%x\n",
+						__func__, payload[1]);
 				break;
 			default:
 				pr_err("%s: Unknown cmd 0x%x\n", __func__,
@@ -473,10 +391,6 @@ int afe_sizeof_cfg_cmd(u16 port_id)
 	case AFE_PORT_ID_PRIMARY_MI2S_TX:
 	case AFE_PORT_ID_QUATERNARY_MI2S_RX:
 	case AFE_PORT_ID_QUATERNARY_MI2S_TX:
-#ifdef CONFIG_SND_USE_TERT_MI2S
-	case AFE_PORT_ID_TERTIARY_MI2S_RX:
-	case AFE_PORT_ID_TERTIARY_MI2S_TX:
-#endif
 		ret_size = SIZEOF_CFG_CMD(afe_param_id_i2s_cfg);
 		break;
 	case HDMI_RX:
@@ -623,6 +537,86 @@ static int afe_send_cal_block(u16 port_id, struct cal_block_data *cal_block)
 
 done:
 	return result;
+}
+
+
+static int afe_send_custom_topology_block(struct cal_block_data *cal_block)
+{
+	int	result = 0;
+	int	index = 0;
+	struct cmd_set_topologies afe_cal;
+
+	if (!cal_block) {
+		pr_err("%s: No AFE SVC cal to send!\n", __func__);
+		return -EINVAL;
+	}
+	if (cal_block->cal_data.size <= 0) {
+		pr_err("%s: AFE SVC cal has invalid size: %zd!\n",
+		__func__, cal_block->cal_data.size);
+		return -EINVAL;
+	}
+
+	afe_cal.hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
+				APR_HDR_LEN(APR_HDR_SIZE), APR_PKT_VER);
+	afe_cal.hdr.pkt_size = sizeof(afe_cal);
+	afe_cal.hdr.src_port = 0;
+	afe_cal.hdr.dest_port = 0;
+	afe_cal.hdr.token = index;
+	afe_cal.hdr.opcode = AFE_CMD_ADD_TOPOLOGIES;
+
+	afe_cal.payload_size = cal_block->cal_data.size;
+	afe_cal.payload_addr_lsw =
+		lower_32_bits(cal_block->cal_data.paddr);
+	afe_cal.payload_addr_msw =
+		upper_32_bits(cal_block->cal_data.paddr);
+	afe_cal.mem_map_handle = cal_block->map_data.q6map_handle;
+
+	pr_debug("%s:cmd_id:0x%x calsize:%zd memmap_hdl:0x%x caladdr:0x%pa",
+		__func__, AFE_CMD_ADD_TOPOLOGIES, cal_block->cal_data.size,
+		afe_cal.mem_map_handle, &cal_block->cal_data.paddr);
+
+	result = afe_apr_send_pkt(&afe_cal, &this_afe.wait[index]);
+	if (result)
+		pr_err("%s: AFE send topology for command 0x%x failed %d\n",
+		       __func__, AFE_CMD_ADD_TOPOLOGIES, result);
+
+	return result;
+}
+
+static void afe_send_custom_topology(void)
+{
+	struct cal_block_data   *cal_block = NULL;
+	int cal_index = AFE_CUST_TOPOLOGY_CAL;
+	int ret;
+
+	if (this_afe.cal_data[cal_index] == NULL) {
+		pr_err("%s: cal_index %d not allocated!\n",
+			__func__, cal_index);
+		return;
+	}
+	mutex_lock(&this_afe.cal_data[cal_index]->lock);
+
+	if (!this_afe.set_custom_topology)
+		goto unlock;
+	this_afe.set_custom_topology = 0;
+	cal_block = cal_utils_get_only_cal_block(this_afe.cal_data[cal_index]);
+	if (cal_block == NULL) {
+		pr_err("%s cal_block not found!!\n", __func__);
+		goto unlock;
+	}
+
+	pr_debug("%s: Sending cal_index cal %d\n", __func__, cal_index);
+
+	remap_cal_data(cal_block, cal_index);
+	ret = afe_send_custom_topology_block(cal_block);
+	if (ret < 0) {
+		pr_err("%s: No cal sent for cal_index %d! ret %d\n",
+			__func__, cal_index, ret);
+		goto unlock;
+	}
+	pr_debug("%s:sent custom topology for AFE\n", __func__);
+unlock:
+	mutex_unlock(&this_afe.cal_data[cal_index]->lock);
 }
 
 static int afe_spk_ramp_dn_cfg(int port)
@@ -930,19 +924,146 @@ fail_cmd:
 	pr_debug("%s: port_id 0x%x rate %u delay_usec %d status %d\n",
 	__func__, port_id, rate, delay_entry.delay_usec, ret);
 	return ret;
+}
+
+static struct cal_block_data *afe_find_cal_topo_id_by_port(
+			struct cal_type_data *cal_type, u16 port_id)
+{
+	struct list_head		*ptr, *next;
+	struct cal_block_data	*cal_block = NULL;
+	int32_t path;
+	struct audio_cal_info_afe_top *afe_top;
+
+	list_for_each_safe(ptr, next,
+		&cal_type->cal_blocks) {
+		cal_block = list_entry(ptr,
+			struct cal_block_data, list);
+
+		path = ((afe_get_port_type(port_id) ==
+			MSM_AFE_PORT_TYPE_TX)?(TX_DEVICE):(RX_DEVICE));
+		afe_top =
+		(struct audio_cal_info_afe_top *)cal_block->cal_info;
+		if (afe_top->path == path) {
+			pr_debug("%s: top_id:%x acdb_id:%d afe_port:%d\n",
+			__func__, afe_top->topology, afe_top->acdb_id,
+			q6audio_get_port_id(port_id));
+			return cal_block;
+		}
+	}
+	return NULL;
+}
+
+static int afe_get_cal_topology_id(u16 port_id, u32 *topology_id)
+{
+	int ret = 0;
+
+	struct cal_block_data   *cal_block = NULL;
+	struct audio_cal_info_afe_top   *afe_top_info = NULL;
+
+	if (this_afe.cal_data[AFE_TOPOLOGY_CAL] == NULL) {
+		pr_err("%s: [AFE_TOPOLOGY_CAL] not initialized\n", __func__);
+		return -EINVAL;
+	}
+	if (topology_id == NULL) {
+		pr_err("%s: topology_id is NULL\n", __func__);
+		return -EINVAL;
+	}
+	*topology_id = 0;
+
+	mutex_lock(&this_afe.cal_data[AFE_TOPOLOGY_CAL]->lock);
+	cal_block = afe_find_cal_topo_id_by_port(
+		this_afe.cal_data[AFE_TOPOLOGY_CAL], port_id);
+	if (cal_block == NULL) {
+		pr_err("%s: [AFE_TOPOLOGY_CAL] not initialized for this port %d\n",
+				__func__, port_id);
+		ret = -EINVAL;
+		goto unlock;
+	}
+
+	afe_top_info = ((struct audio_cal_info_afe_top *)
+		cal_block->cal_info);
+	if (!afe_top_info->topology) {
+		pr_err("%s: invalid topology id : [%d, %d]\n",
+		       __func__, afe_top_info->acdb_id, afe_top_info->topology);
+		ret = -EINVAL;
+		goto unlock;
+	}
+	*topology_id = (u32)afe_top_info->topology;
+
+	pr_debug("%s: port_id = %u acdb_id = %d topology_id = %u ret=%d\n",
+		__func__, port_id, afe_top_info->acdb_id,
+		afe_top_info->topology, ret);
+unlock:
+	mutex_unlock(&this_afe.cal_data[AFE_TOPOLOGY_CAL]->lock);
+	return ret;
+}
+
+static int afe_send_port_topology_id(u16 port_id)
+{
+	struct afe_audioif_config_command	config;
+	int index = 0;
+	int ret = 0;
+	u32 topology_id = 0;
+
+	index = q6audio_get_port_index(port_id);
+	if (index < 0 || index > AFE_MAX_PORTS) {
+		pr_err("%s: AFE port index[%d] invalid!\n",
+				__func__, index);
+		goto done;
+	}
+
+	ret = afe_get_cal_topology_id(port_id, &topology_id);
+	if (ret || !topology_id) {
+		pr_debug("%s: AFE port[%d] get_cal_topology[%d] invalid!\n",
+				__func__, port_id, topology_id);
+		goto done;
+	}
+
+	config.hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD,
+				APR_HDR_LEN(APR_HDR_SIZE), APR_PKT_VER);
+	config.hdr.pkt_size = sizeof(config);
+	config.hdr.src_port = 0;
+	config.hdr.dest_port = 0;
+	config.hdr.token = index;
+
+	config.hdr.opcode = AFE_PORT_CMD_SET_PARAM_V2;
+	config.param.port_id = q6audio_get_port_id(port_id);
+	config.param.payload_size = sizeof(config) - sizeof(struct apr_hdr) -
+				    sizeof(config.param);
+	config.param.payload_address_lsw = 0x00;
+	config.param.payload_address_msw = 0x00;
+	config.param.mem_map_handle = 0x00;
+	config.pdata.module_id = AFE_MODULE_AUDIO_DEV_INTERFACE;
+	config.pdata.param_id   = AFE_PARAM_ID_SET_TOPOLOGY;
+	config.pdata.param_size =  sizeof(config.port);
+	config.port.topology.minor_version = AFE_API_VERSION_TOPOLOGY_V1;
+	config.port.topology.topology_id = topology_id;
+
+	pr_debug("%s: param PL size=%d iparam_size[%d][%zd %zd %zd %zd] param_id[0x%x]\n",
+		__func__, config.param.payload_size, config.pdata.param_size,
+		sizeof(config), sizeof(config.param), sizeof(config.port),
+		sizeof(struct apr_hdr), config.pdata.param_id);
+
+	ret = afe_apr_send_pkt(&config, &this_afe.wait[index]);
+	if (ret) {
+		pr_err("%s: AFE set topology id enable for port 0x%x failed %d\n",
+			__func__, port_id, ret);
+		goto done;
+	} else if (atomic_read(&this_afe.status) != 0) {
+		pr_err("%s: set topology_id config cmd failed\n", __func__);
+		ret = -EINVAL;
+		goto done;
+	}
+done:
+	pr_debug("%s: AFE set topology id 0x%x  enable for port 0x%x ret %d\n",
+			__func__, topology_id, port_id, ret);
+	return ret;
 
 }
 
 static void remap_cal_data(struct cal_block_data *cal_block, int cal_index)
 {
 	int ret = 0;
-
-	if (cal_block->map_data.ion_client == NULL) {
-		pr_err("%s: No ION allocation for cal index %d!\n",
-			__func__, cal_index);
-		ret = -EINVAL;
-		goto done;
-	}
 
 	if ((cal_block->map_data.map_size > 0) &&
 		(cal_block->map_data.q6map_handle == 0)) {
@@ -1850,6 +1971,10 @@ int afe_port_start(u16 port_id, union afe_port_config *afe_config,
 	}
 
 	mutex_lock(&this_afe.afe_cmd_lock);
+	/* Also send the topology id here: */
+	afe_send_custom_topology(); /* One time call: only for first time */
+	afe_send_port_topology_id(port_id);
+
 	afe_send_cal(port_id);
 	afe_send_hw_delay(port_id, rate);
 
@@ -2111,6 +2236,9 @@ int afe_open(u16 port_id,
 		pr_err("%s: Q6 interface prepare failed %d\n", __func__, ret);
 		return -EINVAL;
 	}
+	/* Also send the topology id here: */
+	afe_send_custom_topology(); /* One time call: only for first time  */
+	afe_send_port_topology_id(port_id);
 
 	ret = q6audio_validate_port(port_id);
 	if (ret < 0) {
@@ -2634,7 +2762,7 @@ int q6afe_audio_client_buf_alloc_contiguous(unsigned int dir,
 	size_t len;
 
 	if (!(ac) || ((dir != IN) && (dir != OUT))) {
-		pr_err("%s: ac %p dir %d\n", __func__, ac, dir);
+		pr_err("%s: ac %pK dir %d\n", __func__, ac, dir);
 		return -EINVAL;
 	}
 
@@ -2686,7 +2814,7 @@ int q6afe_audio_client_buf_alloc_contiguous(unsigned int dir,
 			buf[cnt].used = dir ^ 1;
 			buf[cnt].size = bufsz;
 			buf[cnt].actual_size = bufsz;
-			pr_debug("%s:  data[%p]phys[%pa][%p]\n", __func__,
+			pr_debug("%s:  data[%pK]phys[%pa][%pK]\n", __func__,
 				   buf[cnt].data,
 				   &buf[cnt].phys,
 				   &buf[cnt].phys);
@@ -2898,7 +3026,7 @@ int q6afe_audio_client_buf_free_contiguous(unsigned int dir,
 	cnt = port->max_buf_cnt - 1;
 
 	if (port->buf[0].data) {
-		pr_debug("%s: data[%p]phys[%pa][%p] , client[%p] handle[%p]\n",
+		pr_debug("%s: data[%pK]phys[%pa][%pK] , client[%pK] handle[%pK]\n",
 			__func__,
 			port->buf[0].data,
 			&port->buf[0].phys,
@@ -3560,9 +3688,6 @@ int afe_validate_port(u16 port_id)
 	case AFE_PORT_ID_SECONDARY_MI2S_RX:
 	case AFE_PORT_ID_QUATERNARY_MI2S_RX:
 	case AFE_PORT_ID_QUATERNARY_MI2S_TX:
-#ifdef CONFIG_SND_USE_TERT_MI2S
-	case AFE_PORT_ID_TERTIARY_MI2S_RX:
-#endif
 	case AFE_PORT_ID_TERTIARY_MI2S_TX:
 	{
 		ret = 0;
@@ -4215,6 +4340,12 @@ static int get_cal_type_index(int32_t cal_type)
 	case AFE_SIDETONE_CAL_TYPE:
 		ret = AFE_SIDETONE_CAL;
 		break;
+	case AFE_TOPOLOGY_CAL_TYPE:
+		ret = AFE_TOPOLOGY_CAL;
+		break;
+	case AFE_CUST_TOPOLOGY_CAL_TYPE:
+		ret = AFE_CUST_TOPOLOGY_CAL;
+		break;
 	default:
 		pr_err("%s: invalid cal type %d!\n", __func__, cal_type);
 	}
@@ -4298,6 +4429,15 @@ static int afe_set_cal(int32_t cal_type, size_t data_size,
 		ret = -EINVAL;
 		goto done;
 	}
+
+	if (cal_index == AFE_CUST_TOPOLOGY_CAL) {
+		mutex_lock(&this_afe.cal_data[AFE_CUST_TOPOLOGY_CAL]->lock);
+		this_afe.set_custom_topology = 1;
+		pr_debug("%s:[AFE_CUSTOM_TOPOLOGY] ret = %d, cal type = %d!\n",
+			__func__, ret, cal_type);
+		mutex_unlock(&this_afe.cal_data[AFE_CUST_TOPOLOGY_CAL]->lock);
+	}
+
 done:
 	return ret;
 }
@@ -4582,7 +4722,19 @@ static int afe_init_cal_data(void)
 		{{AFE_SIDETONE_CAL_TYPE,
 		{NULL, NULL, NULL,
 		afe_set_cal, NULL, NULL} },
-		{NULL, NULL, cal_utils_match_buf_num} }
+		{NULL, NULL, cal_utils_match_buf_num} },
+
+		{{AFE_TOPOLOGY_CAL_TYPE,
+		{NULL, NULL, NULL,
+		afe_set_cal, NULL, NULL} },
+		{NULL, NULL,
+		cal_utils_match_buf_num} },
+
+		{{AFE_CUST_TOPOLOGY_CAL_TYPE,
+		{afe_alloc_cal, afe_dealloc_cal, NULL,
+		afe_set_cal, NULL, NULL} },
+		{afe_map_cal_data, afe_unmap_cal_data,
+		cal_utils_match_buf_num} },
 	};
 	pr_debug("%s:\n", __func__);
 
@@ -4670,280 +4822,6 @@ int afe_unmap_rtac_block(uint32_t *mem_map_handle)
 done:
 	return result;
 }
-
-#ifdef CONFIG_SND_TI_SPK_PROT_OPALUM
-#define DEBUG_OPALUM
-int opalum_afe_get_param(int command)
-{
-	int result = 0;
-	int index = 0;
-	unsigned int port_id = AFE_PORT_ID_QUATERNARY_MI2S_RX; // Set the correct port. These are different between RX and TX module
-	unsigned int module_id = 0x00A1AF00; // The module id of the RX module
-	unsigned int param_id = 0;
-	int size = 0;
-	struct afe_custom_opalum_get_config_t* config = NULL;
-	index = q6audio_get_port_index(port_id);
-	command = 0; //test
-	switch(command)
-	{
-		case 0:
-			param_id = 0x00A1AF06;
-			break;
-		case 1:
-			param_id = 0x00A1AF07;
-			break;
-		default:
-			break;
-	}
-	pr_err("module_id:0x%x pram_id:0x%x port:0x%x\n",module_id, param_id, port_id);
-	/* Allocate memory for the message */
-	size = sizeof(struct afe_custom_opalum_get_config_t);
-	config = kzalloc(size, GFP_KERNEL);
-	if(config == NULL)
-	{
-		pr_err("%s: Memory allocation failed!\n", __func__);
-		return 1;
-	}
-	/*
-	 * Set header section
-	 * Note that for get_param this is part of the param struct
-	*/
-	config->hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD, APR_HDR_LEN(APR_HDR_SIZE), APR_PKT_VER);
-	config->hdr.pkt_size = size;
-	config->hdr.src_svc = APR_SVC_AFE;
-	config->hdr.src_domain = APR_DOMAIN_APPS;
-	config->hdr.src_port = 0;
-	config->hdr.dest_svc = APR_SVC_AFE;
-	config->hdr.dest_domain = APR_DOMAIN_ADSP;
-	config->hdr.dest_port = 0;
-	config->hdr.token = index;
-	config->hdr.opcode = AFE_PORT_CMD_GET_PARAM_V2;
-	/* Set param section */
-	config->param.port_id = port_id;
-	config->param.payload_size = sizeof(struct afe_port_param_data_v2) + sizeof(struct opalum_dual_data_ctrl_t);
-	config->param.payload_address_lsw = 0;
-	config->param.payload_address_msw = 0;
-	config->param.mem_map_handle = 0;
-	config->param.module_id = module_id;
-	config->param.param_id = param_id;
-	/* Set data section */
-	config->data.module_id = module_id;
-	config->data.param_id = param_id;
-	config->data.param_size = sizeof(struct opalum_dual_data_ctrl_t);
-	config->data.reserved = 0; // Must be set to 0
-	pr_debug("%s: Preparing to send apr packet.\n", __func__);
-	result = afe_apr_send_pkt(config, &this_afe.wait[index]);
-	if (result)
-	{
-		pr_err("%s: Opalum get_param for port %d failed with code %d\n", __func__, port_id, result);
-	}
-	else
-	{
-		pr_debug("%s: Opalum get_param sent packet with param id 0x%08x to module 0x%08x.\n", __func__, param_id, module_id);
-	}
-	kfree(config);
-	return result;
-}
-int opalum_afe_set_param(int command)
-{
-    int result = 0;
-    int index = 0;
-    unsigned int port_id = 0;
-    unsigned int module_id = 0;
-    unsigned int param_id = 0;
-    int size = 0;
-    struct afe_custom_opalum_set_config_t* config = NULL;
-    struct opalum_single_data_ctrl_t* settings = NULL;
-
-    /* Destination settings for message */
-    //port_id = AFE_PORT_ID_SECONDARY_MI2S_RX; // Set to match system
-    port_id = AFE_PORT_ID_QUATERNARY_MI2S_RX;
-    module_id = 0x00A1AF00; // Opalum RX module
-    //module_id = 0x00A1AF02; // Opalum RX module
-    //param_id = 0x00A1AF03; // Run calibration param id
-    param_id = 0x00A1AF02; // Run calibration param id
-    index = q6audio_get_port_index(port_id);
-
-    /* Allocate memory for the message */
-    size = sizeof(struct afe_custom_opalum_set_config_t) + sizeof(struct opalum_single_data_ctrl_t);
-    config = kzalloc(size, GFP_KERNEL);
-
-    if(config == NULL) {
-        pr_err("%s: Memory allocation failed!\n", __func__);
-        return 1;
-    }
-
-    settings = (struct opalum_single_data_ctrl_t*)((u8*)config + sizeof(struct afe_custom_opalum_set_config_t));
-
-    /* Configure actual parameter settings */
-    settings->value = command;
-
-    /* Set header section */
-    config->hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD, APR_HDR_LEN(APR_HDR_SIZE), APR_PKT_VER);
-    config->hdr.pkt_size = size;
-    config->hdr.src_svc = APR_SVC_AFE;
-    config->hdr.src_domain = APR_DOMAIN_APPS;
-    config->hdr.src_port = 0;
-    config->hdr.dest_svc = APR_SVC_AFE;
-    config->hdr.dest_domain = APR_DOMAIN_ADSP;
-    config->hdr.dest_port = 0;
-    config->hdr.token = index;
-    config->hdr.opcode = AFE_PORT_CMD_SET_PARAM_V2;
-
-    /* Set param section */
-    config->param.port_id = port_id;
-    config->param.payload_size = sizeof(struct afe_port_param_data_v2) + sizeof(struct opalum_single_data_ctrl_t);
-    config->param.payload_address_lsw = 0;
-    config->param.payload_address_msw = 0;
-    config->param.mem_map_handle = 0;
-
-    /* Set data section */
-    config->data.module_id = module_id;
-    config->data.param_id = param_id;
-    config->data.param_size = sizeof(struct opalum_single_data_ctrl_t);
-    config->data.reserved = 0; // Must be set to 0
-    pr_debug("%s: Preparing to send apr packet.\n", __func__);
-    result = afe_apr_send_pkt(config, &this_afe.wait[index]);
-
-    if(result) {
-        pr_err("%s: Opalum set_param for port %d failed with code %d\n", __func__, port_id, result);
-    } else {
-#ifdef DEBUG_OPALUM
-        pr_info("%s: Opalum set_param sent packet with param id 0x%08x to module 0x%08x.\n", __func__, param_id, module_id);
-#else
-        pr_debug("%s: Opalum set_param sent packet with param id 0x%08x to module 0x%08x.\n", __func__, param_id, module_id);
-#endif
-    }
-
-    kfree(config);
-    return result;
-}
-
-int opalum_afe_send_config(int rx_tx, const char* cfg_strings)
-{
-    int result = 0;
-    int index = 0;
-    unsigned int port_id = 0;
-    unsigned int module_id = 0;
-    unsigned int param_id = 0;
-    int size = 0;
-    int string_size = 0;
-    int mem_size = 0;
-    int sent = 0;
-    int chars_to_send = 0;
-    struct afe_custom_opalum_set_config_t* config = NULL;
-    struct opalum_external_config_t* payload = NULL;
-
-    /* Destination settings for first message */
-    if( rx_tx == 0 ) {  // Rx
-        port_id = AFE_PORT_ID_QUATERNARY_MI2S_RX;
-        module_id = 0x00A1AF00;
-        param_id = 0x00A1AF05;
-    } else if( rx_tx == 1 ) {   // Tx
-        port_id = AFE_PORT_ID_QUATERNARY_MI2S_TX;
-        module_id = 0x00A1BF00;
-        param_id = 0x00A1BF08;
-    }
-
-    index = q6audio_get_port_index(port_id);
-
-    string_size = strlen(cfg_strings)+1;
-
-#ifdef DEBUG_OPALUM
-    {
-        int i = 0;
-        for(i=string_size-5;i<string_size;i++)
-            pr_err("%s: cfg_strings[%d] is '%c'.\n", __func__, i, cfg_strings[i]);
-    }
-#endif  // DEBUG_OPALUM
-
-    if(string_size > 4000)
-        mem_size = 4000;
-    else
-        mem_size = string_size;
-
-    /* Allocate memory for the message */
-    size = sizeof(struct afe_custom_opalum_set_config_t) + sizeof(struct opalum_external_config_t) + mem_size;
-    config = kzalloc(size, GFP_KERNEL);
-
-    if(config == NULL) {
-        pr_err("%s: Memory allocation failed!\n", __func__);
-        return 1;
-    }
-
-    payload = (struct opalum_external_config_t*)((u8*)config + sizeof(struct afe_custom_opalum_set_config_t));
-    payload->total_size = string_size;
-
-    /* Send config string in chunks of maximum 4000 bytes */
-    while(sent < string_size) {
-
-        chars_to_send = string_size - sent;
-        if(chars_to_send > 4000) {
-            chars_to_send = 4000;
-            payload->done = 0;
-        } else {
-            payload->done = 1;
-        }
-
-        /* Configure per message parameter settings */
-        memcpy((&payload->config), cfg_strings + sent, chars_to_send);
-        //memcpy((char*)&payload->config, cfg_strings + sent, chars_to_send);
-        //memcpy((char*)&payload->config, string + sent, chars_to_send);
-
-        payload->chunk_size = chars_to_send;
-
-        /* Set header section */
-        config->hdr.hdr_field = APR_HDR_FIELD(APR_MSG_TYPE_SEQ_CMD, APR_HDR_LEN(APR_HDR_SIZE), APR_PKT_VER);
-        config->hdr.pkt_size = sizeof(struct afe_custom_opalum_set_config_t) + sizeof(struct opalum_external_config_t)+chars_to_send;
-        config->hdr.src_svc = APR_SVC_AFE;
-        config->hdr.src_domain = APR_DOMAIN_APPS;
-        config->hdr.src_port = 0;
-        config->hdr.dest_svc = APR_SVC_AFE;
-        config->hdr.dest_domain = APR_DOMAIN_ADSP;
-        config->hdr.dest_port = 0;
-        config->hdr.token = index;
-        config->hdr.opcode = AFE_PORT_CMD_SET_PARAM_V2;
-
-        /* Set param section */
-        config->param.port_id = port_id;
-        config->param.payload_size = sizeof(struct afe_port_param_data_v2) + sizeof(struct opalum_external_config_t) + chars_to_send;
-        config->param.payload_address_lsw = 0;
-        config->param.payload_address_msw = 0;
-        config->param.mem_map_handle = 0;
-
-        /* Set data section */
-        config->data.module_id = module_id;
-        config->data.param_id = param_id;
-        config->data.param_size = sizeof(struct opalum_external_config_t) + chars_to_send;
-        config->data.reserved = 0; // Must be set to 0
-
-#ifdef DEBUG_OPALUM
-        pr_info("%s: payload->total_size = %d, payload->chunk_size = %d, payload->done =%d ", __func__,
-            payload->total_size, payload->chunk_size, payload->done);
-#endif  // DEBUG_OPALUM
-
-        pr_debug("%s: Preparing to send apr packet.\n", __func__);
-        result = afe_apr_send_pkt(config, &this_afe.wait[index]);
-        if(result) {
-            pr_err("%s: Opalum set_param for port %d failed with code %d\n", __func__, port_id, result);
-        } else {
-#ifdef DEBUG_OPALUM
-            pr_info("%s: Opalum set_param sent packet with param id 0x%08x to module 0x%08x.\n", __func__, param_id, module_id);
-#else
-            pr_debug("%s: Opalum set_param sent packet with param id 0x%08x to module 0x%08x.\n", __func__, param_id, module_id);
-#endif  // DEBUG_OPALUM
-        }
-        sent += chars_to_send;
-    }
-#ifdef DEBUG_OPALUM
-    pr_info("%s: Opalum set_param sent packet size is %d.\n", __func__, sent);
-#endif  // DEBUG_OPALUM
-
-    kfree(config);
-    return result;
-}
-
-#endif  // CONFIG_SND_TI_SPK_PROT_OPALUM
 
 static int __init afe_init(void)
 {
